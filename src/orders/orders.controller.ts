@@ -1,10 +1,8 @@
-import {
-  Controller,
-  NotImplementedException,
-  ParseIntPipe,
-} from '@nestjs/common';
+import { Controller, ParseUUIDPipe } from '@nestjs/common';
 import { MessagePattern, Payload } from '@nestjs/microservices';
+import { OrderPaginationDto } from './dto';
 import { CreateOrderDto } from './dto/create-order.dto';
+import { StatusDto } from './dto/status.dto';
 import { OrdersService } from './orders.service';
 
 @Controller()
@@ -17,17 +15,17 @@ export class OrdersController {
   }
 
   @MessagePattern('findAllOrders')
-  findAll() {
-    return this.ordersService.findAll();
+  findAll(@Payload() paginationDto: OrderPaginationDto) {
+    return this.ordersService.findAll(paginationDto);
   }
 
   @MessagePattern('findOneOrder')
-  findOne(@Payload('id', ParseIntPipe) id: number) {
+  findOne(@Payload('id', ParseUUIDPipe) id: string) {
     return this.ordersService.findOne(id);
   }
 
   @MessagePattern('changeOrderStatus')
-  changeOrderStatus() {
-    throw new NotImplementedException();
+  changeOrderStatus(@Payload() statusDto: StatusDto) {
+    return this.ordersService.changeStatus(statusDto);
   }
 }
