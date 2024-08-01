@@ -5,71 +5,71 @@ import {
   Logger,
   OnModuleInit,
 } from '@nestjs/common';
-import { ClientProxy, RpcException } from '@nestjs/microservices';
-import { PrismaClient } from '@prisma/client';
-import { firstValueFrom } from 'rxjs';
-import { NATS_SERVICE } from 'src/config';
-import { OrderPaginationDto } from './dto';
 import { CreateOrderDto } from './dto/create-order.dto';
-import { StatusDto } from './dto/status.dto';
+import { PrismaClient } from '@prisma/client';
+import { ClientProxy, RpcException } from '@nestjs/microservices';
+import { OrderPaginationDto } from './dto/order-pagination.dto';
+import { ChangeOrderStatusDto, PaidOrderDto } from './dto';
+import { NATS_SERVICE, PRODUCT_SERVICE } from 'src/config';
+import { firstValueFrom, throwError } from 'rxjs';
+import { OrderWithProducts } from './interfaces/order-with-produts.interface';
 
 @Injectable()
 export class OrdersService extends PrismaClient implements OnModuleInit {
   private readonly logger = new Logger('OrdersService');
 
-  constructor(
-    @Inject(NATS_SERVICE)
-    private readonly productClient: ClientProxy,
-  ) {
+  constructor(@Inject(NATS_SERVICE) private readonly client: ClientProxy) {
     super();
   }
 
   async onModuleInit() {
     await this.$connect();
-    this.logger.log(`Order database connected`);
+    this.logger.log('Database connected');
   }
 
   async create(createOrderDto: CreateOrderDto) {
     try {
-      const { items } = createOrderDto;
-      const productsId = items.map((i) => i.productId);
-
+      //1 Confirmar los ids de los productos
+      const productIds = createOrderDto.items.map((item) => item.productId);
       const products: any[] = await firstValueFrom(
-        this.productClient.send({ cmd: 'validate_products' }, productsId),
+        this.client.send({ cmd: 'validate_products' }, productIds),
       );
 
-      const totalAmount = items.reduce((acc, orderItem) => {
+      //2. Cálculos de los valores
+      const totalAmount = createOrderDto.items.reduce((acc, orderItem) => {
         const price = products.find(
           (product) => product.id === orderItem.productId,
         ).price;
-
-        return acc + price * orderItem.quantity;
+        return price * orderItem.quantity;
       }, 0);
 
-      const totalItems = items.reduce((acc, orderItem) => {
+      const totalItems = createOrderDto.items.reduce((acc, orderItem) => {
         return acc + orderItem.quantity;
       }, 0);
 
+      //3. Crear una transacción de base de datos
       const order = await this.order.create({
         data: {
           totalAmount: totalAmount,
           totalItems: totalItems,
-          orderItem: {
+          OrderItem: {
             createMany: {
               data: createOrderDto.items.map((orderItem) => ({
+                price: products.find(
+                  (product) => product.id === orderItem.productId,
+                ).price,
                 productId: orderItem.productId,
                 quantity: orderItem.quantity,
-                price: products.find((p) => p.id === orderItem.productId).price,
               })),
             },
           },
         },
         include: {
-          orderItem: {
+          OrderItem: {
             select: {
               price: true,
-              productId: true,
               quantity: true,
+              productId: true,
             },
           },
         },
@@ -77,12 +77,13 @@ export class OrdersService extends PrismaClient implements OnModuleInit {
 
       return {
         ...order,
-        orderItem: order.orderItem.map((orderItem) => ({
+        OrderItem: order.OrderItem.map((orderItem) => ({
           ...orderItem,
-          name: products.find((p) => p.id === orderItem.productId).name,
+          name: products.find((product) => product.id === orderItem.productId)
+            .name,
         })),
       };
-    } catch (err) {
+    } catch (error) {
       throw new RpcException({
         status: HttpStatus.BAD_REQUEST,
         message: 'Check logs',
@@ -90,83 +91,125 @@ export class OrdersService extends PrismaClient implements OnModuleInit {
     }
   }
 
-  async findAll(paginationDto: OrderPaginationDto) {
+  async findAll(orderPaginationDto: OrderPaginationDto) {
     const totalPages = await this.order.count({
       where: {
-        status: paginationDto.status,
+        status: orderPaginationDto.status,
       },
     });
 
-    const currentPage = paginationDto.page;
-    const perPage = paginationDto.limit;
+    const currentPage = orderPaginationDto.page;
+    const perPage = orderPaginationDto.limit;
 
     return {
       data: await this.order.findMany({
         skip: (currentPage - 1) * perPage,
         take: perPage,
         where: {
-          status: paginationDto.status,
+          status: orderPaginationDto.status,
         },
       }),
-      metadata: {
+      meta: {
         total: totalPages,
         page: currentPage,
-        lasPage: Math.ceil(totalPages / perPage),
+        lastPage: Math.ceil(totalPages / perPage),
       },
     };
   }
 
   async findOne(id: string) {
-    try {
-      const order = await this.order.findFirst({
-        where: { id },
-        include: {
-          orderItem: {
-            select: {
-              price: true,
-              productId: true,
-              quantity: true,
-            },
+    const order = await this.order.findFirst({
+      where: { id },
+      include: {
+        OrderItem: {
+          select: {
+            price: true,
+            quantity: true,
+            productId: true,
           },
         },
+      },
+    });
+
+    if (!order) {
+      throw new RpcException({
+        status: HttpStatus.NOT_FOUND,
+        message: `Order with id ${id} not found`,
       });
-
-      if (!order)
-        throw new RpcException({
-          status: HttpStatus.NOT_FOUND,
-          message: 'Order with id not foubd',
-        });
-
-      const productsId = order.orderItem.map((i) => i.productId);
-
-      const products: any[] = await firstValueFrom(
-        this.productClient.send({ cmd: 'validate_products' }, productsId),
-      );
-
-      return {
-        ...order,
-        orderItem: order.orderItem.map((orderItem) => ({
-          ...orderItem,
-          name: products.find((p) => p.id === orderItem.productId).name,
-        })),
-      };
-    } catch (error) {
-      throw new RpcException(error);
     }
+
+    const productIds = order.OrderItem.map((orderItem) => orderItem.productId);
+    const products: any[] = await firstValueFrom(
+      this.client.send({ cmd: 'validate_products' }, productIds),
+    );
+
+    return {
+      ...order,
+      OrderItem: order.OrderItem.map((orderItem) => ({
+        ...orderItem,
+        name: products.find((product) => product.id === orderItem.productId)
+          .name,
+      })),
+    };
   }
 
-  async changeStatus(statusDto: StatusDto) {
-    const { id, status } = statusDto;
+  async changeStatus(changeOrderStatusDto: ChangeOrderStatusDto) {
+    const { id, status } = changeOrderStatusDto;
 
     const order = await this.findOne(id);
-
-    if (order.status === status) return order;
+    if (order.status === status) {
+      return order;
+    }
 
     return this.order.update({
       where: { id },
-      data: {
-        status,
-      },
+      data: { status: status },
     });
   }
+
+  async createPaymentSession(order: OrderWithProducts) {
+
+    const paymentSession = await firstValueFrom(
+      this.client.send('create.payment.session', {
+        orderId: order.id,
+        currency: 'usd',
+        items: order.OrderItem.map( item => ({
+          name: item.name,
+          price: item.price,
+          quantity: item.quantity,
+        }) ),
+      }),
+    );
+
+    return paymentSession;
+  }
+
+
+
+  async paidOrder( paidOrderDto: PaidOrderDto ) {
+
+    this.logger.log('Order Paid');
+    this.logger.log(paidOrderDto);
+
+    const order = await this.order.update({
+      where: { id: paidOrderDto.orderId },
+      data: {
+        status: 'PAID',
+        paid: true,
+        paidAt: new Date(),
+        stripeChargeId: paidOrderDto.stripePaymentId,
+
+        // La relación
+        OrderReceipt: {
+          create: {
+            receiptUrl: paidOrderDto.receiptUrl
+          }
+        }
+      }
+    });
+
+    return order;
+
+  }
+
 }
